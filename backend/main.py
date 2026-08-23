@@ -20,19 +20,17 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if GROQ_API_KEY:
-    # Defend against trailing/leading whitespace or newlines
-    # that sneak in from copy-pasting into env var UIs -
-    # these break the Authorization header entirely.
     GROQ_API_KEY = GROQ_API_KEY.strip()
 
 client = Groq(api_key=GROQ_API_KEY)
 
 MODEL_NAME = "openai/gpt-oss-120b"
 
-# Conversation memory: session_id -> list of chat messages
+# Conversation memory
+# session_id -> list of messages
 chat_sessions = {}
 
-# Store which browser location belongs to each session
+# Store browser location for each session
 session_locations = {}
 
 
@@ -90,73 +88,13 @@ def get_coordinates(city):
 
 
 # =========================================================
-# WEATHER CACHE (avoids hammering Open-Meteo)
+# WEATHER CACHE
 # =========================================================
 
 _weather_cache = {}
 
-WEATHER_CACHE_TTL_SECONDS = 300  # 5 minutes
-
-OPEN_METEO_MAX_RETRIES = 3
-OPEN_METEO_DEFAULT_BACKOFF_SECONDS = 3
-
-
-def _fetch_open_meteo_with_retry(url, params):
-
-    last_error = None
-
-    for attempt in range(1, OPEN_METEO_MAX_RETRIES + 1):
-
-        try:
-
-            response = requests.get(
-                url,
-                params=params,
-                timeout=10
-            )
-
-            response.raise_for_status()
-
-            return response.json()
-
-        except requests.exceptions.HTTPError as error:
-
-            last_error = error
-
-            status_code = getattr(
-                error.response, "status_code", None
-            )
-
-            if status_code != 429:
-                # Not a rate-limit error, don't retry
-                raise
-
-            if attempt == OPEN_METEO_MAX_RETRIES:
-                break
-
-            retry_after = None
-
-            if error.response is not None:
-
-                retry_after = error.response.headers.get(
-                    "Retry-After"
-                )
-
-            delay = (
-                float(retry_after)
-                if retry_after
-                else OPEN_METEO_DEFAULT_BACKOFF_SECONDS
-            )
-
-            print(
-                f"Open-Meteo rate limited "
-                f"(attempt {attempt}/{OPEN_METEO_MAX_RETRIES}). "
-                f"Retrying in {delay:.1f}s..."
-            )
-
-            time.sleep(delay)
-
-    raise last_error
+# 5 minutes
+WEATHER_CACHE_TTL_SECONDS = 300
 
 
 # =========================================================
@@ -170,19 +108,21 @@ def get_weather(
 ):
 
     # -----------------------------------------------------
-    # Check cache first
-    #
-    # Open-Meteo's free tier rate-limits fairly aggressively.
-    # Weather doesn't change meaningfully within a few
-    # minutes, and the model sometimes retries the same
-    # (or near-identical) call multiple times in one turn -
-    # caching absorbs both cases.
+    # CACHE KEY
     # -----------------------------------------------------
+    #
+    # Round coordinates slightly so very tiny GPS changes
+    # don't create a completely new cache entry.
+    #
 
     cache_key = (
         round(latitude, 2),
         round(longitude, 2)
     )
+
+    # -----------------------------------------------------
+    # CHECK CACHE
+    # -----------------------------------------------------
 
     cached = _weather_cache.get(cache_key)
 
@@ -190,10 +130,31 @@ def get_weather(
 
         cached_at, cached_data = cached
 
-        if time.time() - cached_at < WEATHER_CACHE_TTL_SECONDS:
+        if (
+            time.time() - cached_at
+            < WEATHER_CACHE_TTL_SECONDS
+        ):
+
+            print(
+                "Using cached weather for:",
+                cache_key
+            )
 
             return cached_data
 
+        else:
+
+            # Cache expired
+            del _weather_cache[cache_key]
+
+    # -----------------------------------------------------
+    # CACHE MISS
+    # -----------------------------------------------------
+
+    print(
+        "Fetching fresh weather from Open-Meteo:",
+        cache_key
+    )
 
     url = "https://api.open-meteo.com/v1/forecast"
 
@@ -239,7 +200,23 @@ def get_weather(
         "timezone": timezone
     }
 
-    data = _fetch_open_meteo_with_retry(url, params)
+    # -----------------------------------------------------
+    # SINGLE OPEN-METEO REQUEST
+    # -----------------------------------------------------
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=10
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    # -----------------------------------------------------
+    # SAVE TO CACHE
+    # -----------------------------------------------------
 
     _weather_cache[cache_key] = (
         time.time(),
@@ -261,7 +238,7 @@ def get_weather_for_coordinates(
 ):
 
     # -----------------------------------------------------
-    # Get weather
+    # GET WEATHER
     # -----------------------------------------------------
 
     weather_data = get_weather(
@@ -270,16 +247,14 @@ def get_weather_for_coordinates(
         "auto"
     )
 
-
     # -----------------------------------------------------
-    # Daily dates
+    # DAILY DATES
     # -----------------------------------------------------
 
     daily_dates = weather_data["daily"]["time"]
 
-
     # -----------------------------------------------------
-    # Determine requested date
+    # DETERMINE REQUESTED DATE
     # -----------------------------------------------------
 
     if date == "today":
@@ -294,9 +269,8 @@ def get_weather_for_coordinates(
 
         target_date = date
 
-
     # -----------------------------------------------------
-    # Check date
+    # CHECK DATE
     # -----------------------------------------------------
 
     if target_date not in daily_dates:
@@ -309,18 +283,16 @@ def get_weather_for_coordinates(
             )
         }
 
-
     # -----------------------------------------------------
-    # Find day index
+    # FIND DAY INDEX
     # -----------------------------------------------------
 
     day_index = daily_dates.index(
         target_date
     )
 
-
     # -----------------------------------------------------
-    # Daily weather
+    # DAILY WEATHER
     # -----------------------------------------------------
 
     daily_result = {
@@ -359,13 +331,11 @@ def get_weather_for_coordinates(
             [day_index]
     }
 
-
     # =====================================================
     # HOURLY WEATHER
     # =====================================================
 
     hourly_result = []
-
 
     if time_of_day != "all_day":
 
@@ -380,9 +350,8 @@ def get_weather_for_coordinates(
             "night": (21, 24)
         }
 
-
         # -------------------------------------------------
-        # Validate time
+        # VALIDATE TIME
         # -------------------------------------------------
 
         if time_of_day not in time_ranges:
@@ -398,31 +367,30 @@ def get_weather_for_coordinates(
                 )
             }
 
-
         start_hour, end_hour = \
             time_ranges[time_of_day]
 
-
         # -------------------------------------------------
-        # Find matching hours
+        # FIND MATCHING HOURS
         # -------------------------------------------------
 
         for i, time_string in enumerate(
             weather_data["hourly"]["time"]
         ):
 
+            # Only requested date
             if not time_string.startswith(
                 target_date
             ):
 
                 continue
 
-
+            # Get hour
             hour = datetime.fromisoformat(
                 time_string
             ).hour
 
-
+            # Check requested time range
             if start_hour <= hour < end_hour:
 
                 hourly_result.append({
@@ -459,15 +427,19 @@ def get_weather_for_coordinates(
                         ["weather_code"][i]
                 })
 
-
     # =====================================================
-    # RETURN
+    # RETURN WEATHER
     # =====================================================
 
     return {
+
         "success": True,
-        "daily": daily_result,
-        "hourly": hourly_result
+
+        "daily":
+            daily_result,
+
+        "hourly":
+            hourly_result
     }
 
 
@@ -486,10 +458,12 @@ def get_weather_for_city(
     if location is None:
 
         return {
-            "success": False,
-            "error": f"Could not find location: {city}"
-        }
 
+            "success": False,
+
+            "error":
+                f"Could not find location: {city}"
+        }
 
     result = get_weather_for_coordinates(
 
@@ -502,22 +476,24 @@ def get_weather_for_city(
         time_of_day
     )
 
-
     # Add city information
     result["location"] = location
-
 
     return result
 
 
 # =========================================================
-# WEATHER TOOL SCHEMA (OpenAI / Groq function-calling format)
+# WEATHER TOOL SCHEMA
 # =========================================================
 
 WEATHER_TOOL_SCHEMA = {
+
     "type": "function",
+
     "function": {
+
         "name": "get_weather",
+
         "description": (
             "Get real, live weather information for a "
             "location. If the user did not mention a city "
@@ -525,26 +501,38 @@ WEATHER_TOOL_SCHEMA = {
             "location as exactly CURRENT_USER_LOCATION. "
             "Otherwise pass the city name."
         ),
+
         "parameters": {
+
             "type": "object",
+
             "properties": {
+
                 "location": {
+
                     "type": "string",
+
                     "description": (
                         "City name, or exactly "
                         "CURRENT_USER_LOCATION if the user "
                         "did not name a city."
                     )
                 },
+
                 "date": {
+
                     "type": "string",
+
                     "description": (
                         "today, tomorrow, or an explicit "
                         "YYYY-MM-DD date."
                     )
                 },
+
                 "time_of_day": {
+
                     "type": "string",
+
                     "enum": [
                         "morning",
                         "afternoon",
@@ -552,17 +540,24 @@ WEATHER_TOOL_SCHEMA = {
                         "night",
                         "all_day"
                     ],
-                    "description": "Part of day requested."
+
+                    "description":
+                        "Part of day requested."
                 }
             },
-            "required": ["location", "date", "time_of_day"]
+
+            "required": [
+                "location",
+                "date",
+                "time_of_day"
+            ]
         }
     }
 }
 
 
 # =========================================================
-# CREATE LOCATION-AWARE WEATHER TOOL FUNCTION
+# CREATE LOCATION-AWARE WEATHER TOOL
 # =========================================================
 
 def create_weather_tool(
@@ -577,7 +572,7 @@ def create_weather_tool(
     ) -> dict:
 
         # =================================================
-        # USER'S CURRENT LOCATION
+        # CURRENT USER LOCATION
         # =================================================
 
         if (
@@ -597,7 +592,6 @@ def create_weather_tool(
                 time_of_day
             )
 
-
         # =================================================
         # EXPLICIT CITY
         # =================================================
@@ -610,7 +604,6 @@ def create_weather_tool(
 
             time_of_day
         )
-
 
     return get_weather_tool
 
@@ -674,7 +667,7 @@ SYSTEM_PROMPT = (
 
 
 # =========================================================
-# RETRY HELPER FOR GROQ RATE LIMITS (429)
+# GROQ RATE-LIMIT RETRY
 # =========================================================
 
 MAX_RETRIES = 3
@@ -703,7 +696,10 @@ def _extract_retry_delay(error) -> float:
     )
 
     if match:
-        return float(match.group(1)) + 1  # small buffer
+
+        return float(
+            match.group(1)
+        ) + 1
 
     return DEFAULT_BACKOFF_SECONDS
 
@@ -712,23 +708,34 @@ def create_completion_with_retry(**kwargs):
 
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1
+    ):
 
         try:
 
-            return client.chat.completions.create(**kwargs)
+            return client.chat.completions.create(
+                **kwargs
+            )
 
         except Exception as error:
 
             last_error = error
 
+            # Non-rate-limit error
             if not _is_rate_limit_error(error):
+
                 raise
 
+            # Last attempt
             if attempt == MAX_RETRIES:
+
                 break
 
-            delay = _extract_retry_delay(error)
+            delay = _extract_retry_delay(
+                error
+            )
 
             print(
                 f"WeatherGPT rate limited "
@@ -742,48 +749,58 @@ def create_completion_with_retry(**kwargs):
 
 
 # =========================================================
-# MANUAL TOOL-CALLING CHAT LOOP
+# MANUAL GROQ TOOL-CALLING LOOP
 # =========================================================
-#
-# Groq (like OpenAI) requires us to manage the tool-calling
-# loop ourselves: send messages -> check for tool_calls ->
-# run the python function -> send the result back -> get
-# the final natural-language answer. Each of those two API
-# calls is retried independently.
-#
 
-def run_chat_turn(messages, weather_tool_fn):
+def run_chat_turn(
+    messages,
+    weather_tool_fn
+):
 
     MAX_TOOL_ITERATIONS = 5
 
-    for iteration in range(MAX_TOOL_ITERATIONS):
+    for iteration in range(
+        MAX_TOOL_ITERATIONS
+    ):
 
-        # Always offer the tool. gpt-oss-120b will keep
-        # attempting tool calls on follow-up turns even
-        # after receiving a tool result, and Groq rejects
-        # a tool call made when tools weren't offered on
-        # that specific request - so every call in this
-        # loop must include the schema.
-
+        # Always provide the weather tool
         response = create_completion_with_retry(
+
             model=MODEL_NAME,
+
             messages=messages,
-            tools=[WEATHER_TOOL_SCHEMA],
+
+            tools=[
+                WEATHER_TOOL_SCHEMA
+            ]
         )
 
         message = response.choices[0].message
 
-        messages.append(message)
+        messages.append(
+            message
+        )
 
+        tool_calls = getattr(
+            message,
+            "tool_calls",
+            None
+        )
 
-        tool_calls = getattr(message, "tool_calls", None)
+        # -------------------------------------------------
+        # FINAL TEXT RESPONSE
+        # -------------------------------------------------
 
         if not tool_calls:
-            # Model produced a final natural-language answer
-            return message.content, messages
 
+            return (
+                message.content,
+                messages
+            )
 
-        # ---- Execute each requested tool call ----
+        # -------------------------------------------------
+        # EXECUTE TOOL CALLS
+        # -------------------------------------------------
 
         for tool_call in tool_calls:
 
@@ -794,14 +811,27 @@ def run_chat_turn(messages, weather_tool_fn):
                 )
 
                 print(
-                    "WeatherGPT calling tool with args:",
+                    "WeatherGPT calling tool "
+                    "with args:",
                     args
                 )
 
                 result = weather_tool_fn(
-                    location=args.get("location", "CURRENT_USER_LOCATION"),
-                    date=args.get("date", "today"),
-                    time_of_day=args.get("time_of_day", "all_day"),
+
+                    location=args.get(
+                        "location",
+                        "CURRENT_USER_LOCATION"
+                    ),
+
+                    date=args.get(
+                        "date",
+                        "today"
+                    ),
+
+                    time_of_day=args.get(
+                        "time_of_day",
+                        "all_day"
+                    )
                 )
 
                 print(
@@ -819,39 +849,57 @@ def run_chat_turn(messages, weather_tool_fn):
                 traceback.print_exc()
 
                 result = {
+
                     "success": False,
-                    "error": str(tool_error)
+
+                    "error":
+                        str(tool_error)
                 }
 
+            # Send tool result back to Groq
             messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": tool_call.function.name,
-                "content": json.dumps(result)
+
+                "role":
+                    "tool",
+
+                "tool_call_id":
+                    tool_call.id,
+
+                "name":
+                    tool_call.function.name,
+
+                "content":
+                    json.dumps(result)
             })
 
-        # Loop back around so the model can either use the
-        # tool result to answer, or (rarely) call the tool
-        # again with different arguments.
-
-
-    # Safety net: hit the iteration cap without a plain
-    # text answer. Ask one last time with the tool
-    # disabled so the model is forced to summarize
-    # whatever tool results it already has.
+    # =====================================================
+    # SAFETY NET
+    # =====================================================
 
     final_response = create_completion_with_retry(
+
         model=MODEL_NAME,
+
         messages=messages,
-        tools=[WEATHER_TOOL_SCHEMA],
-        tool_choice="none",
+
+        tools=[
+            WEATHER_TOOL_SCHEMA
+        ],
+
+        tool_choice="none"
     )
 
-    final_message = final_response.choices[0].message
+    final_message = \
+        final_response.choices[0].message
 
-    messages.append(final_message)
+    messages.append(
+        final_message
+    )
 
-    return final_message.content, messages
+    return (
+        final_message.content,
+        messages
+    )
 
 
 # =========================================================
@@ -911,7 +959,7 @@ def chat(
 ):
 
     # =====================================================
-    # CREATE LOCATION-AWARE WEATHER TOOL
+    # CREATE LOCATION-AWARE TOOL
     # =====================================================
 
     weather_tool = create_weather_tool(
@@ -921,9 +969,8 @@ def chat(
         longitude
     )
 
-
     # =====================================================
-    # CHECK WHETHER LOCATION CHANGED
+    # CHECK LOCATION CHANGE
     # =====================================================
 
     old_location = session_locations.get(
@@ -935,15 +982,9 @@ def chat(
         longitude
     )
 
-
     # =====================================================
-    # CREATE / RESET SESSION MESSAGE HISTORY
+    # CREATE / RESET SESSION
     # =====================================================
-    #
-    # We reset history if the browser location changes.
-    # This prevents an old location from being stuck in
-    # the conversation context.
-    #
 
     if (
         session_id not in chat_sessions
@@ -951,19 +992,26 @@ def chat(
     ):
 
         chat_sessions[session_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+
+            {
+                "role":
+                    "system",
+
+                "content":
+                    SYSTEM_PROMPT
+            }
         ]
 
-        # Save location associated with session
-        session_locations[session_id] = \
-            new_location
+        session_locations[
+            session_id
+        ] = new_location
 
-
-    messages = chat_sessions[session_id]
-
+    messages = chat_sessions[
+        session_id
+    ]
 
     # =====================================================
-    # GIVE MODEL LOCATION INFORMATION
+    # GIVE GROQ BROWSER LOCATION
     # =====================================================
 
     if (
@@ -986,19 +1034,24 @@ def chat(
             f"Current longitude: {longitude}. "
 
             f"User's message: {message}"
-
         )
 
     else:
 
         final_message = message
 
+    # =====================================================
+    # ADD USER MESSAGE
+    # =====================================================
 
     messages.append({
-        "role": "user",
-        "content": final_message
-    })
 
+        "role":
+            "user",
+
+        "content":
+            final_message
+    })
 
     # =====================================================
     # SEND TO GROQ
@@ -1007,12 +1060,15 @@ def chat(
     try:
 
         answer_text, messages = run_chat_turn(
+
             messages,
+
             weather_tool
         )
 
-        chat_sessions[session_id] = messages
-
+        chat_sessions[
+            session_id
+        ] = messages
 
         # =================================================
         # RETURN RESPONSE
@@ -1036,7 +1092,6 @@ def chat(
             }
         }
 
-
     except Exception as error:
 
         print(
@@ -1044,45 +1099,54 @@ def chat(
             error
         )
 
-        # Print the full traceback AND the underlying
-        # cause chain (e.g. the real httpx/socket error
-        # hiding behind a generic "Connection error.")
-        # so it shows up in Render's logs.
         traceback.print_exc()
 
+        # Print underlying causes
         cause = error.__cause__
 
         depth = 0
 
-        while cause is not None and depth < 5:
+        while (
+            cause is not None
+            and depth < 5
+        ):
 
             print(
-                f"  caused by ({type(cause).__name__}):",
+                f"caused by "
+                f"({type(cause).__name__}):",
                 cause
             )
 
-            cause = getattr(cause, "__cause__", None)
+            cause = getattr(
+                cause,
+                "__cause__",
+                None
+            )
 
             depth += 1
 
+        # =================================================
+        # RATE LIMIT RESPONSE
+        # =================================================
 
         if _is_rate_limit_error(error):
 
             reply_text = (
-                "WeatherGPT is getting a lot of "
-                "requests right now and hit its "
-                "rate limit. Please wait a few "
-                "seconds and try again."
+
+                "WeatherGPT is getting a lot "
+                "of requests right now and hit "
+                "its rate limit. Please wait a "
+                "few seconds and try again."
             )
 
         else:
 
             reply_text = (
+
                 "I couldn't retrieve the "
                 "weather right now. "
                 "Please try again."
             )
-
 
         return {
 
