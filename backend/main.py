@@ -5,23 +5,24 @@ from datetime import datetime
 import os
 import re
 import time
+import json
 from dotenv import load_dotenv
-from google import genai
+from groq import Groq
 
 
 # =========================================================
-# GEMINI SETUP
+# GROQ SETUP
 # =========================================================
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+client = Groq(api_key=GROQ_API_KEY)
 
-# Conversation memory
+MODEL_NAME = "openai/gpt-oss-120b"
+
+# Conversation memory: session_id -> list of chat messages
 chat_sessions = {}
 
 # Store which browser location belongs to each session
@@ -43,7 +44,7 @@ app.add_middleware(
 
 
 # =========================================================
-# CITY → LATITUDE + LONGITUDE
+# CITY -> LATITUDE + LONGITUDE
 # =========================================================
 
 def get_coordinates(city):
@@ -362,37 +363,14 @@ def get_weather_for_coordinates(
     # =====================================================
 
     return {
-
         "success": True,
-
-        "location": {
-
-            "latitude":
-                latitude,
-
-            "longitude":
-                longitude
-        },
-
-        "date":
-            target_date,
-
-        "time_of_day":
-            time_of_day,
-
-        "current":
-            weather_data["current"],
-
-        "daily":
-            daily_result,
-
-        "hourly":
-            hourly_result
+        "daily": daily_result,
+        "hourly": hourly_result
     }
 
 
 # =========================================================
-# WEATHER FROM CITY
+# WEATHER FROM CITY NAME
 # =========================================================
 
 def get_weather_for_city(
@@ -403,15 +381,11 @@ def get_weather_for_city(
 
     location = get_coordinates(city)
 
-
     if location is None:
 
         return {
-
             "success": False,
-
-            "error":
-                f"I couldn't find the location '{city}'."
+            "error": f"Could not find location: {city}"
         }
 
 
@@ -435,7 +409,58 @@ def get_weather_for_city(
 
 
 # =========================================================
-# CREATE LOCATION-AWARE GEMINI TOOL
+# WEATHER TOOL SCHEMA (OpenAI / Groq function-calling format)
+# =========================================================
+
+WEATHER_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": (
+            "Get real, live weather information for a "
+            "location. If the user did not mention a city "
+            "and their browser location is available, pass "
+            "location as exactly CURRENT_USER_LOCATION. "
+            "Otherwise pass the city name."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": (
+                        "City name, or exactly "
+                        "CURRENT_USER_LOCATION if the user "
+                        "did not name a city."
+                    )
+                },
+                "date": {
+                    "type": "string",
+                    "description": (
+                        "today, tomorrow, or an explicit "
+                        "YYYY-MM-DD date."
+                    )
+                },
+                "time_of_day": {
+                    "type": "string",
+                    "enum": [
+                        "morning",
+                        "afternoon",
+                        "evening",
+                        "night",
+                        "all_day"
+                    ],
+                    "description": "Part of day requested."
+                }
+            },
+            "required": ["location", "date", "time_of_day"]
+        }
+    }
+}
+
+
+# =========================================================
+# CREATE LOCATION-AWARE WEATHER TOOL FUNCTION
 # =========================================================
 
 def create_weather_tool(
@@ -448,15 +473,6 @@ def create_weather_tool(
         date: str,
         time_of_day: str
     ) -> dict:
-
-        """
-        Get real weather information.
-
-        If location is CURRENT_USER_LOCATION,
-        use the user's exact browser coordinates.
-
-        Otherwise use the city name.
-        """
 
         # =================================================
         # USER'S CURRENT LOCATION
@@ -498,19 +514,69 @@ def create_weather_tool(
 
 
 # =========================================================
-# RETRY HELPER FOR GEMINI RATE LIMITS (429)
+# SYSTEM PROMPT
 # =========================================================
-#
-# The Gemini free tier allows only 15 requests/minute for
-# this model, shared across ALL users of this backend.
-# When we hit that limit, Google tells us how long to wait
-# via a "Please retry in X seconds" message / RetryInfo
-# field. Instead of giving up immediately, we honor that
-# delay and retry a few times before failing.
-#
+
+SYSTEM_PROMPT = (
+
+    "You are WeatherGPT, "
+    "a conversational AI "
+    "weather assistant. "
+
+    "Always use the weather "
+    "tool for live weather "
+    "questions. "
+
+    "Never invent current "
+    "or forecast weather. "
+
+    "Remember the user's "
+    "previously mentioned "
+    "location within the "
+    "conversation. "
+
+    "If the user asks "
+    "a follow-up such as "
+    "'what about tomorrow?', "
+    "use the same location "
+    "from the previous question. "
+
+    "If the user does not "
+    "mention a city and the "
+    "current browser location "
+    "is available, call the "
+    "weather tool using exactly "
+    "CURRENT_USER_LOCATION. "
+
+    "Do not ask the user "
+    "to repeatedly provide "
+    "their location. "
+
+    "If the user explicitly "
+    "mentions another city, "
+    "use that city instead. "
+
+    "For example, if the user "
+    "asks 'Can I go play outside "
+    "today evening?' without "
+    "mentioning a city, use "
+    "CURRENT_USER_LOCATION, "
+    "today, evening. "
+
+    "For general climate questions, "
+    "answer using general knowledge. "
+
+    "Keep answers natural, "
+    "clear and concise."
+)
+
+
+# =========================================================
+# RETRY HELPER FOR GROQ RATE LIMITS (429)
+# =========================================================
 
 MAX_RETRIES = 3
-DEFAULT_BACKOFF_SECONDS = 5
+DEFAULT_BACKOFF_SECONDS = 3
 
 
 def _is_rate_limit_error(error) -> bool:
@@ -520,6 +586,7 @@ def _is_rate_limit_error(error) -> bool:
     return (
         "RESOURCE_EXHAUSTED" in message
         or "429" in message
+        or "rate_limit" in message.lower()
     )
 
 
@@ -527,10 +594,8 @@ def _extract_retry_delay(error) -> float:
 
     message = str(error)
 
-    # Look for something like "retry in 8.55s" or
-    # "retryDelay': '8s'"
     match = re.search(
-        r"retry(?:Delay)?['\"]?\s*[:\s]\s*['\"]?(\d+(?:\.\d+)?)s",
+        r"retry(?:[-_ ]?after)?['\"]?\s*[:\s]\s*['\"]?(\d+(?:\.\d+)?)",
         message,
         re.IGNORECASE
     )
@@ -541,7 +606,7 @@ def _extract_retry_delay(error) -> float:
     return DEFAULT_BACKOFF_SECONDS
 
 
-def send_message_with_retry(chat_session, final_message):
+def create_completion_with_retry(**kwargs):
 
     last_error = None
 
@@ -549,16 +614,13 @@ def send_message_with_retry(chat_session, final_message):
 
         try:
 
-            return chat_session.send_message(
-                final_message
-            )
+            return client.chat.completions.create(**kwargs)
 
         except Exception as error:
 
             last_error = error
 
             if not _is_rate_limit_error(error):
-                # Not a rate-limit issue, don't retry
                 raise
 
             if attempt == MAX_RETRIES:
@@ -574,8 +636,85 @@ def send_message_with_retry(chat_session, final_message):
 
             time.sleep(delay)
 
-    # All retries exhausted
     raise last_error
+
+
+# =========================================================
+# MANUAL TOOL-CALLING CHAT LOOP
+# =========================================================
+#
+# Groq (like OpenAI) requires us to manage the tool-calling
+# loop ourselves: send messages -> check for tool_calls ->
+# run the python function -> send the result back -> get
+# the final natural-language answer. Each of those two API
+# calls is retried independently.
+#
+
+def run_chat_turn(messages, weather_tool_fn):
+
+    # ---- First call: model decides whether to use the tool ----
+
+    response = create_completion_with_retry(
+        model=MODEL_NAME,
+        messages=messages,
+        tools=[WEATHER_TOOL_SCHEMA],
+    )
+
+    message = response.choices[0].message
+
+    messages.append(message)
+
+
+    tool_calls = getattr(message, "tool_calls", None)
+
+    if not tool_calls:
+        # No tool needed, this is the final answer
+        return message.content, messages
+
+
+    # ---- Execute each requested tool call ----
+
+    for tool_call in tool_calls:
+
+        try:
+
+            args = json.loads(
+                tool_call.function.arguments
+            )
+
+            result = weather_tool_fn(
+                location=args.get("location", "CURRENT_USER_LOCATION"),
+                date=args.get("date", "today"),
+                time_of_day=args.get("time_of_day", "all_day"),
+            )
+
+        except Exception as tool_error:
+
+            result = {
+                "success": False,
+                "error": str(tool_error)
+            }
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "name": tool_call.function.name,
+            "content": json.dumps(result)
+        })
+
+
+    # ---- Second call: model writes the final answer ----
+
+    final_response = create_completion_with_retry(
+        model=MODEL_NAME,
+        messages=messages,
+    )
+
+    final_message = final_response.choices[0].message
+
+    messages.append(final_message)
+
+    return final_message.content, messages
 
 
 # =========================================================
@@ -661,12 +800,12 @@ def chat(
 
 
     # =====================================================
-    # CREATE NEW GEMINI SESSION
+    # CREATE / RESET SESSION MESSAGE HISTORY
     # =====================================================
     #
-    # We recreate the session if the browser location
-    # changes. This prevents an old location from being
-    # stuck inside the previous tool.
+    # We reset history if the browser location changes.
+    # This prevents an old location from being stuck in
+    # the conversation context.
     #
 
     if (
@@ -674,88 +813,20 @@ def chat(
         or old_location != new_location
     ):
 
-        chat_sessions[session_id] = \
-            client.chats.create(
-
-                model="gemini-3.5-flash-lite",
-
-                config={
-
-                    "tools": [
-                        weather_tool
-                    ],
-
-                    "system_instruction": (
-
-                        "You are WeatherGPT, "
-                        "a conversational AI "
-                        "weather assistant. "
-
-                        "Always use the weather "
-                        "tool for live weather "
-                        "questions. "
-
-                        "Never invent current "
-                        "or forecast weather. "
-
-                        "Remember the user's "
-                        "previously mentioned "
-                        "location within the "
-                        "conversation. "
-
-                        "If the user asks "
-                        "a follow-up such as "
-                        "'what about tomorrow?', "
-                        "use the same location "
-                        "from the previous question. "
-
-                        "If the user does not "
-                        "mention a city and the "
-                        "current browser location "
-                        "is available, call the "
-                        "weather tool using exactly "
-                        "CURRENT_USER_LOCATION. "
-
-                        "Do not ask the user "
-                        "to repeatedly provide "
-                        "their location. "
-
-                        "If the user explicitly "
-                        "mentions another city, "
-                        "use that city instead. "
-
-                        "For example, if the user "
-                        "asks 'Can I go play outside "
-                        "today evening?' without "
-                        "mentioning a city, use "
-                        "CURRENT_USER_LOCATION, "
-                        "today, evening. "
-
-                        "For general climate questions, "
-                        "answer using general knowledge. "
-
-                        "Keep answers natural, "
-                        "clear and concise."
-                    )
-                }
-            )
-
+        chat_sessions[session_id] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
 
         # Save location associated with session
         session_locations[session_id] = \
             new_location
 
 
-    # =====================================================
-    # GET CHAT SESSION
-    # =====================================================
-
-    chat_session = \
-        chat_sessions[session_id]
+    messages = chat_sessions[session_id]
 
 
     # =====================================================
-    # GIVE GEMINI LOCATION INFORMATION
+    # GIVE MODEL LOCATION INFORMATION
     # =====================================================
 
     if (
@@ -786,16 +857,24 @@ def chat(
         final_message = message
 
 
+    messages.append({
+        "role": "user",
+        "content": final_message
+    })
+
+
     # =====================================================
-    # SEND TO GEMINI
+    # SEND TO GROQ
     # =====================================================
 
     try:
 
-        response = send_message_with_retry(
-            chat_session,
-            final_message
+        answer_text, messages = run_chat_turn(
+            messages,
+            weather_tool
         )
+
+        chat_sessions[session_id] = messages
 
 
         # =================================================
@@ -805,7 +884,7 @@ def chat(
         return {
 
             "response":
-                response.text,
+                answer_text,
 
             "session_id":
                 session_id,
