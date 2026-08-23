@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WeatherGPT</title>
+
+<link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+<div class="horizon"></div>
+
+<!-- Location status -->
+<div id="locationStatus" class="location-status">
+  📍 Detecting your location...
+</div>
+
+<div class="app">
+
+  <aside class="sidebar">
+
+    <div class="brand">
+
+      <div class="brand-mark"></div>
+
+      <div class="brand-text">
+        <div class="name">WeatherGPT</div>
+        <div class="sub">Ask the sky anything</div>
+      </div>
+
+    </div>
+
+
+    <div>
+
+      <div class="sidebar-section-label">
+        Try asking
+      </div>
+
+      <button
+        class="prompt-chip"
+        data-prompt="What's the weather here right now?"
+      >
+        <span class="chip-ic">☁️</span>
+        <span>What's the weather here right now?</span>
+      </button>
+
+      <button
+        class="prompt-chip"
+        data-prompt="Will it rain tomorrow?"
+      >
+        <span class="chip-ic">🌧️</span>
+        <span>Will it rain tomorrow?</span>
+      </button>
+
+      <button
+        class="prompt-chip"
+        data-prompt="Should I carry an umbrella today?"
+      >
+        <span class="chip-ic">☂️</span>
+        <span>Should I carry an umbrella today?</span>
+      </button>
+
+      <button
+        class="prompt-chip"
+        data-prompt="Give me the 7-day forecast"
+      >
+        <span class="chip-ic">📅</span>
+        <span>Give me the 7-day forecast</span>
+      </button>
+
+      <button
+        class="prompt-chip"
+        data-prompt="How windy is it right now?"
+      >
+        <span class="chip-ic">🌬️</span>
+        <span>How windy is it right now?</span>
+      </button>
+
+    </div>
+
+
+    <div class="sidebar-footer">
+
+      📍 WeatherGPT automatically uses your current location.
+
+      <br><br>
+
+      Powered by Gemini AI + Open-Meteo live weather data.
+
+    </div>
+
+  </aside>
+
+
+  <main class="main">
+
+    <div class="topbar">
+
+      <h1>Conversation</h1>
+
+      <span class="live-dot">
+        LIVE · AI WEATHER
+      </span>
+
+    </div>
+
+
+    <div
+      class="chat-scroll"
+      id="chatScroll"
+    >
+
+      <div
+        class="chat-inner"
+        id="chatInner"
+      >
+
+        <div
+          class="empty-state"
+          id="emptyState"
+        >
+
+          <div class="glyph">
+
+            <svg
+              width="30"
+              height="30"
+              viewBox="0 0 24 24"
+              fill="none"
+            >
+
+              <path
+                d="M7 18a4.5 4.5 0 0 1-.5-8.98A5.5 5.5 0 0 1 17 8.5a4 4 0 0 1-.5 7.99"
+                stroke="#5FC6E8"
+                stroke-width="1.6"
+                stroke-linecap="round"
+              />
+
+              <circle
+                cx="12"
+                cy="7"
+                r="2.6"
+                stroke="#F5A93B"
+                stroke-width="1.6"
+              />
+
+            </svg>
+
+          </div>
+
+
+          <h2>
+            Ask about the sky, anywhere.
+          </h2>
+
+
+          <p>
+            WeatherGPT automatically detects your location.
+            Ask questions like "Will it rain tomorrow?"
+            without telling us your city every time.
+          </p>
+
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div class="composer-wrap">
+
+      <div
+        class="chip-strip"
+        id="chipStrip"
+      >
+
+        <button
+          class="mini-chip"
+          data-prompt="What's the weather here?"
+        >
+          Current weather
+        </button>
+
+        <button
+          class="mini-chip"
+          data-prompt="Will it rain tomorrow?"
+        >
+          Rain tomorrow?
+        </button>
+
+        <button
+          class="mini-chip"
+          data-prompt="Should I carry an umbrella?"
+        >
+          Umbrella?
+        </button>
+
+        <button
+          class="mini-chip"
+          data-prompt="Give me the 7-day forecast"
+        >
+          7-day forecast
+        </button>
+
+      </div>
+
+
+      <div class="composer">
+
+        <input
+          id="chatInput"
+          type="text"
+          placeholder="Ask WeatherGPT about the weather..."
+          autocomplete="off"
+        />
+
+
+        <button
+          class="send-btn"
+          id="sendBtn"
+          aria-label="Send"
+        >
+
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+          >
+
+            <path
+              d="M4 12L20 4L14 20L11 13L4 12Z"
+              fill="#0F1626"
+            />
+
+          </svg>
+
+        </button>
+
+      </div>
+
+
+      <div class="composer-note">
+
+        WeatherGPT uses your location + Gemini AI +
+        Open-Meteo live weather data.
+
+      </div>
+
+    </div>
+
+  </main>
+
+</div>
+
+
+<script src="script.js"></script>
+
+</body>
+</html>
