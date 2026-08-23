@@ -90,6 +90,76 @@ def get_coordinates(city):
 
 
 # =========================================================
+# WEATHER CACHE (avoids hammering Open-Meteo)
+# =========================================================
+
+_weather_cache = {}
+
+WEATHER_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+OPEN_METEO_MAX_RETRIES = 3
+OPEN_METEO_DEFAULT_BACKOFF_SECONDS = 3
+
+
+def _fetch_open_meteo_with_retry(url, params):
+
+    last_error = None
+
+    for attempt in range(1, OPEN_METEO_MAX_RETRIES + 1):
+
+        try:
+
+            response = requests.get(
+                url,
+                params=params,
+                timeout=10
+            )
+
+            response.raise_for_status()
+
+            return response.json()
+
+        except requests.exceptions.HTTPError as error:
+
+            last_error = error
+
+            status_code = getattr(
+                error.response, "status_code", None
+            )
+
+            if status_code != 429:
+                # Not a rate-limit error, don't retry
+                raise
+
+            if attempt == OPEN_METEO_MAX_RETRIES:
+                break
+
+            retry_after = None
+
+            if error.response is not None:
+
+                retry_after = error.response.headers.get(
+                    "Retry-After"
+                )
+
+            delay = (
+                float(retry_after)
+                if retry_after
+                else OPEN_METEO_DEFAULT_BACKOFF_SECONDS
+            )
+
+            print(
+                f"Open-Meteo rate limited "
+                f"(attempt {attempt}/{OPEN_METEO_MAX_RETRIES}). "
+                f"Retrying in {delay:.1f}s..."
+            )
+
+            time.sleep(delay)
+
+    raise last_error
+
+
+# =========================================================
 # GET WEATHER FROM OPEN-METEO
 # =========================================================
 
@@ -98,6 +168,32 @@ def get_weather(
     longitude,
     timezone="auto"
 ):
+
+    # -----------------------------------------------------
+    # Check cache first
+    #
+    # Open-Meteo's free tier rate-limits fairly aggressively.
+    # Weather doesn't change meaningfully within a few
+    # minutes, and the model sometimes retries the same
+    # (or near-identical) call multiple times in one turn -
+    # caching absorbs both cases.
+    # -----------------------------------------------------
+
+    cache_key = (
+        round(latitude, 2),
+        round(longitude, 2)
+    )
+
+    cached = _weather_cache.get(cache_key)
+
+    if cached is not None:
+
+        cached_at, cached_data = cached
+
+        if time.time() - cached_at < WEATHER_CACHE_TTL_SECONDS:
+
+            return cached_data
+
 
     url = "https://api.open-meteo.com/v1/forecast"
 
@@ -143,15 +239,14 @@ def get_weather(
         "timezone": timezone
     }
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=10
+    data = _fetch_open_meteo_with_retry(url, params)
+
+    _weather_cache[cache_key] = (
+        time.time(),
+        data
     )
 
-    response.raise_for_status()
-
-    return response.json()
+    return data
 
 
 # =========================================================
