@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 from datetime import datetime
 import os
+import re
+import time
 from dotenv import load_dotenv
 from google import genai
 
@@ -496,6 +498,87 @@ def create_weather_tool(
 
 
 # =========================================================
+# RETRY HELPER FOR GEMINI RATE LIMITS (429)
+# =========================================================
+#
+# The Gemini free tier allows only 15 requests/minute for
+# this model, shared across ALL users of this backend.
+# When we hit that limit, Google tells us how long to wait
+# via a "Please retry in X seconds" message / RetryInfo
+# field. Instead of giving up immediately, we honor that
+# delay and retry a few times before failing.
+#
+
+MAX_RETRIES = 3
+DEFAULT_BACKOFF_SECONDS = 5
+
+
+def _is_rate_limit_error(error) -> bool:
+
+    message = str(error)
+
+    return (
+        "RESOURCE_EXHAUSTED" in message
+        or "429" in message
+    )
+
+
+def _extract_retry_delay(error) -> float:
+
+    message = str(error)
+
+    # Look for something like "retry in 8.55s" or
+    # "retryDelay': '8s'"
+    match = re.search(
+        r"retry(?:Delay)?['\"]?\s*[:\s]\s*['\"]?(\d+(?:\.\d+)?)s",
+        message,
+        re.IGNORECASE
+    )
+
+    if match:
+        return float(match.group(1)) + 1  # small buffer
+
+    return DEFAULT_BACKOFF_SECONDS
+
+
+def send_message_with_retry(chat_session, final_message):
+
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+
+            return chat_session.send_message(
+                final_message
+            )
+
+        except Exception as error:
+
+            last_error = error
+
+            if not _is_rate_limit_error(error):
+                # Not a rate-limit issue, don't retry
+                raise
+
+            if attempt == MAX_RETRIES:
+                break
+
+            delay = _extract_retry_delay(error)
+
+            print(
+                f"WeatherGPT rate limited "
+                f"(attempt {attempt}/{MAX_RETRIES}). "
+                f"Retrying in {delay:.1f}s..."
+            )
+
+            time.sleep(delay)
+
+    # All retries exhausted
+    raise last_error
+
+
+# =========================================================
 # HOME ENDPOINT
 # =========================================================
 
@@ -709,7 +792,8 @@ def chat(
 
     try:
 
-        response = chat_session.send_message(
+        response = send_message_with_retry(
+            chat_session,
             final_message
         )
 
@@ -745,12 +829,41 @@ def chat(
         )
 
 
+        if _is_rate_limit_error(error):
+
+            reply_text = (
+                "WeatherGPT is getting a lot of "
+                "requests right now and hit its "
+                "rate limit. Please wait a few "
+                "seconds and try again."
+            )
+
+        else:
+
+            reply_text = (
+                "I couldn't retrieve the "
+                "weather right now. "
+                "Please try again."
+            )
+
+
         return {
-    "response": f"Backend error: {str(error)}",
-    "session_id": session_id,
-    "location": {
-        "latitude": latitude,
-        "longitude": longitude
-    },
-    "error": str(error)
-}
+
+            "response":
+                reply_text,
+
+            "session_id":
+                session_id,
+
+            "location": {
+
+                "latitude":
+                    latitude,
+
+                "longitude":
+                    longitude
+            },
+
+            "error":
+                str(error)
+        }
