@@ -746,25 +746,11 @@ def chat(
 
 
         return {
-
-            "response": (
-                "I couldn't retrieve the "
-                "weather right now. "
-                "Please try again."
-            ),
-
-            "session_id":
-                session_id,
-
-            "location": {
-
-                "latitude":
-                    latitude,
-
-                "longitude":
-                    longitude
-            },
-
-            "error":
-                str(error)
-        }
+    "response": f"Backend error: {str(error)}",
+    "session_id": session_id,
+    "location": {
+        "latitude": latitude,
+        "longitude": longitude
+    },
+    "error": str(error)
+}
