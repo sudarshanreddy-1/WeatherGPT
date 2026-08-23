@@ -698,13 +698,30 @@ def run_chat_turn(messages, weather_tool_fn):
                     tool_call.function.arguments
                 )
 
+                print(
+                    "WeatherGPT calling tool with args:",
+                    args
+                )
+
                 result = weather_tool_fn(
                     location=args.get("location", "CURRENT_USER_LOCATION"),
                     date=args.get("date", "today"),
                     time_of_day=args.get("time_of_day", "all_day"),
                 )
 
+                print(
+                    "WeatherGPT tool result:",
+                    result
+                )
+
             except Exception as tool_error:
+
+                print(
+                    "WeatherGPT tool call FAILED:",
+                    tool_error
+                )
+
+                traceback.print_exc()
 
                 result = {
                     "success": False,
