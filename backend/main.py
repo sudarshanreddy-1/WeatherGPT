@@ -6,6 +6,7 @@ import os
 import re
 import time
 import json
+import traceback
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -906,6 +907,27 @@ def chat(
             "WeatherGPT error:",
             error
         )
+
+        # Print the full traceback AND the underlying
+        # cause chain (e.g. the real httpx/socket error
+        # hiding behind a generic "Connection error.")
+        # so it shows up in Render's logs.
+        traceback.print_exc()
+
+        cause = error.__cause__
+
+        depth = 0
+
+        while cause is not None and depth < 5:
+
+            print(
+                f"  caused by ({type(cause).__name__}):",
+                cause
+            )
+
+            cause = getattr(cause, "__cause__", None)
+
+            depth += 1
 
 
         if _is_rate_limit_error(error):
