@@ -594,8 +594,7 @@ def chat(
         chat_sessions[session_id] = \
             client.chats.create(
 
-                model=
-                    "gemini-3.1-flash-lite",
+                model="gemini-3.5-flash-lite",
 
                 config={
 
