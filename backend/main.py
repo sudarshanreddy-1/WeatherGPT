@@ -19,6 +19,12 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+if GROQ_API_KEY:
+    # Defend against trailing/leading whitespace or newlines
+    # that sneak in from copy-pasting into env var UIs -
+    # these break the Authorization header entirely.
+    GROQ_API_KEY = GROQ_API_KEY.strip()
+
 client = Groq(api_key=GROQ_API_KEY)
 
 MODEL_NAME = "openai/gpt-oss-120b"
@@ -653,62 +659,80 @@ def create_completion_with_retry(**kwargs):
 
 def run_chat_turn(messages, weather_tool_fn):
 
-    # ---- First call: model decides whether to use the tool ----
+    MAX_TOOL_ITERATIONS = 5
 
-    response = create_completion_with_retry(
-        model=MODEL_NAME,
-        messages=messages,
-        tools=[WEATHER_TOOL_SCHEMA],
-    )
+    for iteration in range(MAX_TOOL_ITERATIONS):
 
-    message = response.choices[0].message
+        # Always offer the tool. gpt-oss-120b will keep
+        # attempting tool calls on follow-up turns even
+        # after receiving a tool result, and Groq rejects
+        # a tool call made when tools weren't offered on
+        # that specific request - so every call in this
+        # loop must include the schema.
 
-    messages.append(message)
+        response = create_completion_with_retry(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=[WEATHER_TOOL_SCHEMA],
+        )
 
+        message = response.choices[0].message
 
-    tool_calls = getattr(message, "tool_calls", None)
-
-    if not tool_calls:
-        # No tool needed, this is the final answer
-        return message.content, messages
-
-
-    # ---- Execute each requested tool call ----
-
-    for tool_call in tool_calls:
-
-        try:
-
-            args = json.loads(
-                tool_call.function.arguments
-            )
-
-            result = weather_tool_fn(
-                location=args.get("location", "CURRENT_USER_LOCATION"),
-                date=args.get("date", "today"),
-                time_of_day=args.get("time_of_day", "all_day"),
-            )
-
-        except Exception as tool_error:
-
-            result = {
-                "success": False,
-                "error": str(tool_error)
-            }
-
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "name": tool_call.function.name,
-            "content": json.dumps(result)
-        })
+        messages.append(message)
 
 
-    # ---- Second call: model writes the final answer ----
+        tool_calls = getattr(message, "tool_calls", None)
+
+        if not tool_calls:
+            # Model produced a final natural-language answer
+            return message.content, messages
+
+
+        # ---- Execute each requested tool call ----
+
+        for tool_call in tool_calls:
+
+            try:
+
+                args = json.loads(
+                    tool_call.function.arguments
+                )
+
+                result = weather_tool_fn(
+                    location=args.get("location", "CURRENT_USER_LOCATION"),
+                    date=args.get("date", "today"),
+                    time_of_day=args.get("time_of_day", "all_day"),
+                )
+
+            except Exception as tool_error:
+
+                result = {
+                    "success": False,
+                    "error": str(tool_error)
+                }
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": tool_call.function.name,
+                "content": json.dumps(result)
+            })
+
+        # Loop back around so the model can either use the
+        # tool result to answer, or (rarely) call the tool
+        # again with different arguments.
+
+
+    # Safety net: hit the iteration cap without a plain
+    # text answer. Ask one last time with the tool
+    # disabled so the model is forced to summarize
+    # whatever tool results it already has.
 
     final_response = create_completion_with_retry(
         model=MODEL_NAME,
         messages=messages,
+        tools=[WEATHER_TOOL_SCHEMA],
+        tool_choice="none",
     )
 
     final_message = final_response.choices[0].message
