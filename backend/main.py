@@ -1096,7 +1096,9 @@ def chat(
 
     latitude: float = None,
 
-    longitude: float = None
+    longitude: float = None,
+
+    weather_context: str = None
 
 ):
 
@@ -1179,6 +1181,31 @@ def chat(
 
     if (
 
+        weather_context
+
+        and latitude is not None
+
+        and longitude is not None
+
+    ):
+
+        final_message = (
+
+            "The browser has already fetched live weather data "
+            "from Open-Meteo GFS for the user's current location. "
+            "Use this supplied weather context for questions about "
+            "the current location. Do NOT call the weather tool for "
+            "the current location when this context is present. "
+            "Never invent values that are not present in the context. "
+            "If the user explicitly asks about another city, use the "
+            "weather tool for that city.\n\n"
+            f"Weather context:\n{weather_context}\n\n"
+            f"User's message: {message}"
+
+        )
+
+    elif (
+
         latitude is not None
 
         and longitude is not None
@@ -1187,17 +1214,11 @@ def chat(
 
         final_message = (
 
-            "The user's browser has provided "
-            "their current location. "
-
-            "If the user does not explicitly "
-            "mention another city, use "
+            "The user's browser has provided their current location. "
+            "If the user does not explicitly mention another city, use "
             "CURRENT_USER_LOCATION. "
-
             f"Current latitude: {latitude}. "
-
             f"Current longitude: {longitude}. "
-
             f"User's message: {message}"
 
         )

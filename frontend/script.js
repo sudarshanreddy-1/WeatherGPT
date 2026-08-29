@@ -6,6 +6,11 @@
 
     const API_BASE_URL = 'https://weathergpt-backend.onrender.com';
 
+    const OPEN_METEO_GFS_URL = 'https://api.open-meteo.com/v1/gfs';
+    const WEATHER_CACHE_KEY = 'weathergpt_openmeteo_gfs_cache_v2';
+    const WEATHER_CACHE_TTL = 15 * 60 * 1000;
+    let weatherContextCache = null;
+
 
     // ==========================================
     // DOM ELEMENTS
@@ -331,6 +336,113 @@
 
 
     // ==========================================
+    // OPEN-METEO GFS WEATHER CONTEXT
+    // ==========================================
+
+    function getCachedWeatherContext() {
+
+        try {
+            const raw = localStorage.getItem(WEATHER_CACHE_KEY);
+            if (!raw) return null;
+
+            const cached = JSON.parse(raw);
+
+            if (
+                Date.now() - cached.timestamp < WEATHER_CACHE_TTL &&
+                cached.latitude !== null &&
+                cached.longitude !== null
+            ) {
+                return cached.context;
+            }
+        } catch (error) {
+            console.warn("Weather cache read failed:", error);
+        }
+
+        return null;
+    }
+
+
+    async function fetchOpenMeteoGFSContext(force = false) {
+
+        if (
+            userLatitude === null ||
+            userLongitude === null
+        ) {
+            return null;
+        }
+
+        if (!force) {
+            const cached = getCachedWeatherContext();
+            if (cached) {
+                weatherContextCache = cached;
+                return cached;
+            }
+
+            if (weatherContextCache) {
+                return weatherContextCache;
+            }
+        }
+
+        // 5 current + 4 daily variables = 9 variables.
+        // Keeping this request below 10 variables avoids the
+        // extra weighted API-call cost on Open-Meteo's free tier.
+        const params = new URLSearchParams({
+            latitude: userLatitude,
+            longitude: userLongitude,
+            timezone: "auto",
+            forecast_days: "7",
+            current: "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,precipitation,weather_code",
+            daily: "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
+        });
+
+        try {
+            const response = await fetch(
+                `${OPEN_METEO_GFS_URL}?${params.toString()}`,
+                {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                    cache: "no-store"
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(`Open-Meteo returned ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            const context = {
+                source: "Open-Meteo NOAA GFS",
+                fetched_at: new Date().toISOString(),
+                timezone: data.timezone,
+                latitude: userLatitude,
+                longitude: userLongitude,
+                current: data.current,
+                daily: data.daily
+            };
+
+            weatherContextCache = JSON.stringify(context);
+
+            localStorage.setItem(
+                WEATHER_CACHE_KEY,
+                JSON.stringify({
+                    timestamp: Date.now(),
+                    latitude: userLatitude,
+                    longitude: userLongitude,
+                    context: weatherContextCache
+                })
+            );
+
+            return weatherContextCache;
+
+        } catch (error) {
+            console.error("Open-Meteo GFS error:", error);
+            return null;
+        }
+    }
+
+
+    // ==========================================
     // SEND MESSAGE
     // ==========================================
 
@@ -406,6 +518,24 @@
                 "Sending weather request:",
                 params.toString()
             );
+
+
+            // ==================================
+            // FETCH OPEN-METEO GFS IN BROWSER
+            // ==================================
+
+            // The browser calls Open-Meteo directly. This prevents
+            // Render's shared outbound IP from being the source of
+            // Open-Meteo rate-limit errors.
+            const weatherContext =
+                await fetchOpenMeteoGFSContext();
+
+            if (weatherContext) {
+                params.append(
+                    "weather_context",
+                    weatherContext
+                );
+            }
 
 
             // ==================================
