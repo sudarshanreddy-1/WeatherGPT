@@ -7,6 +7,7 @@ import re
 import time
 import json
 import traceback
+from threading import Lock
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -65,21 +66,18 @@ app.add_middleware(
 
 
 # =========================================================
-# WEATHER CACHE
-# =========================================================
-#
-# Each coordinate gets its own cache.
-#
-# Hyderabad -> cache A
-# Mumbai    -> cache B
-# Delhi     -> cache C
-#
-# Cache expires after 5 minutes.
+# WEATHER / GEOCODING CACHE
 # =========================================================
 
 _weather_cache = {}
+_weather_cache_locks = {}
+_geocode_cache = {}
+_cache_lock = Lock()
 
-WEATHER_CACHE_TTL_SECONDS = 300
+# GFS updates every few hours, so a 15-minute application cache
+# dramatically reduces repeated upstream requests.
+WEATHER_CACHE_TTL_SECONDS = 900
+GEOCODE_CACHE_TTL_SECONDS = 3600
 
 
 # =========================================================
@@ -99,28 +97,33 @@ def get_coordinates(city):
 
     """Resolve a city name to coordinates using Open-Meteo."""
 
+    cache_key = city.strip().lower()
+    cached = _geocode_cache.get(cache_key)
+
+    if cached is not None:
+        cached_at, cached_data = cached
+        if time.time() - cached_at < GEOCODE_CACHE_TTL_SECONDS:
+            return cached_data
+
     response = requests.get(
         OPEN_METEO_GEOCODING_URL,
         params={
             "name": city,
-            "count": 5,
+            "count": 1,
             "language": "en",
             "format": "json"
         },
         timeout=10
     )
-
     response.raise_for_status()
 
     data = response.json()
     results = data.get("results") or []
-
     if not results:
         return None
 
     result = results[0]
-
-    return {
+    location = {
         "latitude": result["latitude"],
         "longitude": result["longitude"],
         "name": result.get("name", city),
@@ -128,18 +131,8 @@ def get_coordinates(city):
         "timezone": result.get("timezone", "auto")
     }
 
-
-# =========================================================
-# WEATHER CACHE
-# =========================================================
-#
-# Each coordinate gets its own cache.
-# Cache expires after 5 minutes.
-# =========================================================
-
-_weather_cache = {}
-
-WEATHER_CACHE_TTL_SECONDS = 300
+    _geocode_cache[cache_key] = (time.time(), location)
+    return location
 
 
 # =========================================================
@@ -193,12 +186,14 @@ def weather_condition(weather_code):
 def get_weather(
     latitude,
     longitude,
-    timezone="auto"
+    timezone="auto",
+    include_hourly=False
 ):
 
     cache_key = (
         round(latitude, 2),
-        round(longitude, 2)
+        round(longitude, 2),
+        bool(include_hourly)
     )
 
     cached = _weather_cache.get(cache_key)
@@ -214,81 +209,102 @@ def get_weather(
             )
             return cached_data
 
-        print(f"Weather cache expired for {cache_key}")
+    # Prevent several simultaneous requests for the same location from
+    # all reaching Open-Meteo at once (important on shared deployments).
+    with _cache_lock:
+        lock = _weather_cache_locks.setdefault(cache_key, Lock())
 
-    print(
-        f"Fetching fresh weather from Open-Meteo GFS "
-        f"for {cache_key}"
-    )
+    with lock:
+        cached = _weather_cache.get(cache_key)
+        if cached is not None:
+            cached_at, cached_data = cached
+            age = time.time() - cached_at
+            if age < WEATHER_CACHE_TTL_SECONDS:
+                return cached_data
 
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "current": (
-            "temperature_2m,"
-            "relative_humidity_2m,"
-            "apparent_temperature,"
-            "wind_speed_10m,"
-            "precipitation,"
-            "weather_code"
-        ),
-        "hourly": (
-            "temperature_2m,"
-            "relative_humidity_2m,"
-            "apparent_temperature,"
-            "precipitation_probability,"
-            "precipitation,"
-            "weather_code,"
-            "wind_speed_10m"
-        ),
-        "daily": (
-            "temperature_2m_max,"
-            "temperature_2m_min,"
-            "precipitation_probability_max,"
-            "weather_code,"
-            "sunrise,"
-            "sunset"
-        ),
-        "forecast_days": 7,
-        "timezone": timezone
-    }
-
-    try:
-        response = requests.get(
-            OPEN_METEO_GFS_URL,
-            params=params,
-            timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    except requests.exceptions.HTTPError as error:
-        status_code = (
-            error.response.status_code
-            if error.response is not None
-            else None
+        print(
+            f"Fetching fresh weather from Open-Meteo GFS "
+            f"for {cache_key}"
         )
 
-        if status_code == 429:
-            raise Exception(
-                "Open-Meteo is temporarily rate limiting "
-                "requests. Please wait a little and try again."
+        # Keep each request at <=10 weather variables. Open-Meteo's
+        # free-tier request weighting increases when more than 10
+        # variables are requested in one call.
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "forecast_days": 7,
+            "timezone": timezone,
+            "daily": (
+                "temperature_2m_max,"
+                "temperature_2m_min,"
+                "precipitation_probability_max,"
+                "weather_code"
+            )
+        }
+
+        if include_hourly:
+            params["hourly"] = (
+                "temperature_2m,"
+                "apparent_temperature,"
+                "precipitation_probability,"
+                "precipitation,"
+                "wind_speed_10m,"
+                "weather_code"
+            )
+        else:
+            params["current"] = (
+                "temperature_2m,"
+                "relative_humidity_2m,"
+                "apparent_temperature,"
+                "wind_speed_10m,"
+                "weather_code"
             )
 
-        raise Exception(
-            f"Open-Meteo request failed (HTTP {status_code})."
+        try:
+            response = requests.get(
+                OPEN_METEO_GFS_URL,
+                params=params,
+                timeout=15
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        except requests.exceptions.HTTPError as error:
+            status_code = (
+                error.response.status_code
+                if error.response is not None
+                else None
+            )
+
+            if status_code == 429:
+                # If we have an older cache, serve it instead of making
+                # the user wait or repeatedly retrying a rate-limited API.
+                stale = _weather_cache.get(cache_key)
+                if stale is not None:
+                    print(
+                        f"Open-Meteo rate limited; serving cached GFS "
+                        f"weather for {cache_key}."
+                    )
+                    return stale[1]
+
+                raise Exception(
+                    "Open-Meteo is temporarily rate limiting requests. "
+                    "Please wait about a minute and try again."
+                )
+
+            raise Exception(
+                f"Open-Meteo request failed (HTTP {status_code})."
+            )
+
+        _weather_cache[cache_key] = (time.time(), data)
+
+        print(
+            f"GFS weather cached for {cache_key} for "
+            f"{WEATHER_CACHE_TTL_SECONDS // 60} minutes."
         )
 
-    _weather_cache[cache_key] = (
-        time.time(),
-        data
-    )
-
-    print(
-        f"GFS weather cached for {cache_key} for 5 minutes."
-    )
-
-    return data
+        return data
 
 
 # =========================================================
@@ -305,7 +321,8 @@ def get_weather_for_coordinates(
     weather_data = get_weather(
         latitude,
         longitude,
-        "auto"
+        "auto",
+        include_hourly=(time_of_day != "all_day")
     )
 
     daily = weather_data.get("daily", {})
@@ -345,9 +362,7 @@ def get_weather_for_coordinates(
         "temperature_min": daily["temperature_2m_min"][day_index],
         "rain_probability": daily["precipitation_probability_max"][day_index],
         "weather_code": daily["weather_code"][day_index],
-        "condition": weather_condition(daily["weather_code"][day_index]),
-        "sunrise": daily["sunrise"][day_index],
-        "sunset": daily["sunset"][day_index]
+        "condition": weather_condition(daily["weather_code"][day_index])
     }
 
     hourly_result = []
