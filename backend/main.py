@@ -18,13 +18,9 @@ from groq import Groq
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 if GROQ_API_KEY:
     GROQ_API_KEY = GROQ_API_KEY.strip()
-
-if WEATHER_API_KEY:
-    WEATHER_API_KEY = WEATHER_API_KEY.strip()
 
 
 # =========================================================
@@ -87,246 +83,210 @@ WEATHER_CACHE_TTL_SECONDS = 300
 
 
 # =========================================================
-# WEATHERAPI HELPER
+# OPEN-METEO GEOCODING
 # =========================================================
 
-def weatherapi_request(
-    latitude=None,
-    longitude=None,
-    city=None
-):
+OPEN_METEO_GEOCODING_URL = (
+    "https://geocoding-api.open-meteo.com/v1/search"
+)
 
-    if not WEATHER_API_KEY:
-
-        raise Exception(
-            "WEATHER_API_KEY is not configured."
-        )
+OPEN_METEO_GFS_URL = (
+    "https://api.open-meteo.com/v1/gfs"
+)
 
 
-    url = (
-        "https://api.weatherapi.com/v1/"
-        "forecast.json"
-    )
+def get_coordinates(city):
 
-
-    # -----------------------------------------------------
-    # Location query
-    # -----------------------------------------------------
-
-    if (
-        latitude is not None
-        and longitude is not None
-    ):
-
-        query = (
-            f"{latitude},{longitude}"
-        )
-
-    elif city:
-
-        query = city
-
-    else:
-
-        raise Exception(
-            "No location was provided."
-        )
-
-
-    params = {
-
-        "key":
-            WEATHER_API_KEY,
-
-        "q":
-            query,
-
-        "days":
-            7,
-
-        "aqi":
-            "no",
-
-        "alerts":
-            "yes"
-    }
-
+    """Resolve a city name to coordinates using Open-Meteo."""
 
     response = requests.get(
-        url,
-        params=params,
-        timeout=15
+        OPEN_METEO_GEOCODING_URL,
+        params={
+            "name": city,
+            "count": 5,
+            "language": "en",
+            "format": "json"
+        },
+        timeout=10
     )
-
-
-    # -----------------------------------------------------
-    # HTTP errors
-    # -----------------------------------------------------
-
-    if response.status_code == 400:
-
-        try:
-
-            error_data = response.json()
-
-            error_message = (
-                error_data
-                .get("error", {})
-                .get(
-                    "message",
-                    "Location not found."
-                )
-            )
-
-        except Exception:
-
-            error_message = (
-                "Location not found."
-            )
-
-
-        raise Exception(
-            f"WeatherAPI error: {error_message}"
-        )
-
-
-    if response.status_code == 401:
-
-        raise Exception(
-            "WeatherAPI authentication failed. "
-            "Check WEATHER_API_KEY."
-        )
-
-
-    if response.status_code == 403:
-
-        raise Exception(
-            "WeatherAPI access is forbidden. "
-            "Check your WeatherAPI plan."
-        )
-
-
-    if response.status_code == 429:
-
-        raise Exception(
-            "WeatherAPI rate limit reached. "
-            "Please try again later."
-        )
-
 
     response.raise_for_status()
 
-
     data = response.json()
+    results = data.get("results") or []
 
+    if not results:
+        return None
 
-    # -----------------------------------------------------
-    # WeatherAPI JSON error
-    # -----------------------------------------------------
+    result = results[0]
 
-    if "error" in data:
-
-        error_message = (
-            data["error"]
-            .get(
-                "message",
-                "Unknown WeatherAPI error."
-            )
-        )
-
-        raise Exception(
-            f"WeatherAPI error: {error_message}"
-        )
-
-
-    return data
+    return {
+        "latitude": result["latitude"],
+        "longitude": result["longitude"],
+        "name": result.get("name", city),
+        "country": result.get("country", ""),
+        "timezone": result.get("timezone", "auto")
+    }
 
 
 # =========================================================
-# GET WEATHER
+# WEATHER CACHE
 # =========================================================
+#
+# Each coordinate gets its own cache.
+# Cache expires after 5 minutes.
+# =========================================================
+
+_weather_cache = {}
+
+WEATHER_CACHE_TTL_SECONDS = 300
+
+
+# =========================================================
+# WMO WEATHER CODE → HUMAN READABLE CONDITION
+# =========================================================
+
+WMO_CONDITIONS = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snow fall",
+    73: "Moderate snow fall",
+    75: "Heavy snow fall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail"
+}
+
+
+def weather_condition(weather_code):
+    return WMO_CONDITIONS.get(
+        weather_code,
+        "Unknown conditions"
+    )
+
+
+# =========================================================
+# GET WEATHER FROM OPEN-METEO GFS
+# =========================================================
+
 
 def get_weather(
     latitude,
-    longitude
+    longitude,
+    timezone="auto"
 ):
-
-    # -----------------------------------------------------
-    # Cache key
-    # -----------------------------------------------------
 
     cache_key = (
         round(latitude, 2),
         round(longitude, 2)
     )
 
-
-    # -----------------------------------------------------
-    # Check cache
-    # -----------------------------------------------------
-
-    cached = _weather_cache.get(
-        cache_key
-    )
-
+    cached = _weather_cache.get(cache_key)
 
     if cached is not None:
-
         cached_at, cached_data = cached
-
-        age = (
-            time.time() - cached_at
-        )
-
+        age = time.time() - cached_at
 
         if age < WEATHER_CACHE_TTL_SECONDS:
-
             print(
-                f"Using cached weather for "
-                f"{cache_key} "
+                f"Using cached GFS weather for {cache_key} "
                 f"(age: {age:.0f}s)"
             )
-
             return cached_data
 
-
-        print(
-            f"Weather cache expired for "
-            f"{cache_key}"
-        )
-
-
-    # -----------------------------------------------------
-    # Fetch fresh data
-    # -----------------------------------------------------
+        print(f"Weather cache expired for {cache_key}")
 
     print(
-        f"Fetching fresh weather from WeatherAPI "
+        f"Fetching fresh weather from Open-Meteo GFS "
         f"for {cache_key}"
     )
 
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": (
+            "temperature_2m,"
+            "relative_humidity_2m,"
+            "apparent_temperature,"
+            "wind_speed_10m,"
+            "precipitation,"
+            "weather_code"
+        ),
+        "hourly": (
+            "temperature_2m,"
+            "relative_humidity_2m,"
+            "apparent_temperature,"
+            "precipitation_probability,"
+            "precipitation,"
+            "weather_code,"
+            "wind_speed_10m"
+        ),
+        "daily": (
+            "temperature_2m_max,"
+            "temperature_2m_min,"
+            "precipitation_probability_max,"
+            "weather_code,"
+            "sunrise,"
+            "sunset"
+        ),
+        "forecast_days": 7,
+        "timezone": timezone
+    }
 
-    data = weatherapi_request(
-        latitude=latitude,
-        longitude=longitude
-    )
+    try:
+        response = requests.get(
+            OPEN_METEO_GFS_URL,
+            params=params,
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
 
+    except requests.exceptions.HTTPError as error:
+        status_code = (
+            error.response.status_code
+            if error.response is not None
+            else None
+        )
 
-    # -----------------------------------------------------
-    # Save cache
-    # -----------------------------------------------------
+        if status_code == 429:
+            raise Exception(
+                "Open-Meteo is temporarily rate limiting "
+                "requests. Please wait a little and try again."
+            )
+
+        raise Exception(
+            f"Open-Meteo request failed (HTTP {status_code})."
+        )
 
     _weather_cache[cache_key] = (
         time.time(),
         data
     )
 
-
     print(
-        f"Weather cached for {cache_key} "
-        f"for 5 minutes."
+        f"GFS weather cached for {cache_key} for 5 minutes."
     )
-
 
     return data
 
@@ -342,427 +302,124 @@ def get_weather_for_coordinates(
     time_of_day="all_day"
 ):
 
-    # -----------------------------------------------------
-    # Get weather
-    # -----------------------------------------------------
-
     weather_data = get_weather(
         latitude,
-        longitude
+        longitude,
+        "auto"
     )
 
+    daily = weather_data.get("daily", {})
+    daily_dates = daily.get("time", [])
 
-    # -----------------------------------------------------
-    # Location
-    # -----------------------------------------------------
-
-    location_data = weather_data.get(
-        "location",
-        {}
-    )
-
-
-    # -----------------------------------------------------
-    # Forecast
-    # -----------------------------------------------------
-
-    forecast_data = weather_data.get(
-        "forecast",
-        {}
-    )
-
-
-    forecast_days = forecast_data.get(
-        "forecastday",
-        []
-    )
-
-
-    if not forecast_days:
-
+    if not daily_dates:
         return {
             "success": False,
-            "error": (
-                "No forecast data was returned."
-            )
+            "error": "No daily forecast data was returned."
         }
-
-
-    # =====================================================
-    # DETERMINE DATE
-    # =====================================================
 
     if date == "today":
-
-        target_date = forecast_days[0]["date"]
-
-
+        target_date = daily_dates[0]
     elif date == "tomorrow":
-
-        if len(forecast_days) < 2:
-
+        if len(daily_dates) < 2:
             return {
                 "success": False,
-                "error": (
-                    "Tomorrow's weather "
-                    "is unavailable."
-                )
+                "error": "Tomorrow's weather is unavailable."
             }
-
-        target_date = forecast_days[1]["date"]
-
-
+        target_date = daily_dates[1]
     else:
-
         target_date = date
 
-
-    # =====================================================
-    # FIND REQUESTED DAY
-    # =====================================================
-
-    selected_day = None
-
-
-    for day in forecast_days:
-
-        if day["date"] == target_date:
-
-            selected_day = day
-
-            break
-
-
-    if selected_day is None:
-
+    if target_date not in daily_dates:
         return {
-
             "success": False,
-
             "error": (
-                f"Weather data is not available "
-                f"for {date}."
+                f"Weather data is not available for {date}."
             )
         }
 
-
-    # =====================================================
-    # DAILY WEATHER
-    # =====================================================
-
-    day_data = selected_day.get(
-        "day",
-        {}
-    )
-
-
-    condition_data = (
-        day_data.get(
-            "condition",
-            {}
-        )
-    )
-
-
-    astro_data = (
-        selected_day.get(
-            "astro",
-            {}
-        )
-    )
-
+    day_index = daily_dates.index(target_date)
 
     daily_result = {
-
-        "date":
-            target_date,
-
-        "temperature_max":
-            day_data.get(
-                "maxtemp_c"
-            ),
-
-        "temperature_min":
-            day_data.get(
-                "mintemp_c"
-            ),
-
-        "rain_probability":
-            day_data.get(
-                "daily_chance_of_rain"
-            ),
-
-        "weather_code":
-            condition_data.get(
-                "code"
-            ),
-
-        "condition":
-            condition_data.get(
-                "text"
-            ),
-
-        "sunrise":
-            astro_data.get(
-                "sunrise"
-            ),
-
-        "sunset":
-            astro_data.get(
-                "sunset"
-            )
+        "date": target_date,
+        "temperature_max": daily["temperature_2m_max"][day_index],
+        "temperature_min": daily["temperature_2m_min"][day_index],
+        "rain_probability": daily["precipitation_probability_max"][day_index],
+        "weather_code": daily["weather_code"][day_index],
+        "condition": weather_condition(daily["weather_code"][day_index]),
+        "sunrise": daily["sunrise"][day_index],
+        "sunset": daily["sunset"][day_index]
     }
-
-
-    # =====================================================
-    # HOURLY WEATHER
-    # =====================================================
 
     hourly_result = []
 
-
     if time_of_day != "all_day":
-
         time_ranges = {
-
-            "morning":
-                (6, 12),
-
-            "afternoon":
-                (12, 17),
-
-            "evening":
-                (17, 21),
-
-            "night":
-                (21, 24)
+            "morning": (6, 12),
+            "afternoon": (12, 17),
+            "evening": (17, 21),
+            "night": (21, 24)
         }
 
-
-        # -------------------------------------------------
-        # Validate time
-        # -------------------------------------------------
-
         if time_of_day not in time_ranges:
-
             return {
-
                 "success": False,
-
                 "error": (
-                    "Invalid time_of_day. "
-                    "Use morning, afternoon, "
+                    "Invalid time_of_day. Use morning, afternoon, "
                     "evening, night, or all_day."
                 )
             }
 
+        start_hour, end_hour = time_ranges[time_of_day]
+        hourly = weather_data.get("hourly", {})
 
-        start_hour, end_hour = (
-            time_ranges[time_of_day]
-        )
-
-
-        # -------------------------------------------------
-        # Get hourly data
-        # -------------------------------------------------
-
-        hours = selected_day.get(
-            "hour",
-            []
-        )
-
-
-        for hour_data in hours:
-
-            time_string = (
-                hour_data.get(
-                    "time"
-                )
-            )
-
-
-            if not time_string:
-
+        for i, time_string in enumerate(hourly.get("time", [])):
+            if not time_string.startswith(target_date):
                 continue
-
 
             try:
-
-                hour = datetime.strptime(
-                    time_string,
-                    "%Y-%m-%d %H:%M"
-                ).hour
-
+                hour = datetime.fromisoformat(time_string).hour
             except ValueError:
-
                 continue
 
-
-            if (
-                start_hour
-                <= hour
-                < end_hour
-            ):
-
-                hourly_condition = (
-                    hour_data.get(
-                        "condition",
-                        {}
-                    )
-                )
-
-
+            if start_hour <= hour < end_hour:
+                code = hourly["weather_code"][i]
                 hourly_result.append({
-
-                    "time":
-                        time_string,
-
-                    "temperature":
-                        hour_data.get(
-                            "temp_c"
-                        ),
-
-                    "feels_like":
-                        hour_data.get(
-                            "feelslike_c"
-                        ),
-
-                    "humidity":
-                        hour_data.get(
-                            "humidity"
-                        ),
-
-                    "rain_probability":
-                        hour_data.get(
-                            "chance_of_rain"
-                        ),
-
-                    "precipitation":
-                        hour_data.get(
-                            "precip_mm"
-                        ),
-
-                    "wind_speed":
-                        hour_data.get(
-                            "wind_kph"
-                        ),
-
-                    "weather_code":
-                        hourly_condition.get(
-                            "code"
-                        ),
-
-                    "condition":
-                        hourly_condition.get(
-                            "text"
-                        )
+                    "time": time_string,
+                    "temperature": hourly["temperature_2m"][i],
+                    "feels_like": hourly["apparent_temperature"][i],
+                    "humidity": hourly["relative_humidity_2m"][i],
+                    "rain_probability": hourly["precipitation_probability"][i],
+                    "precipitation": hourly["precipitation"][i],
+                    "wind_speed": hourly["wind_speed_10m"][i],
+                    "weather_code": code,
+                    "condition": weather_condition(code)
                 })
 
-
-    # =====================================================
-    # CURRENT WEATHER
-    # =====================================================
-
-    current_data = weather_data.get(
-        "current",
-        {}
-    )
-
-
-    current_condition = (
-        current_data.get(
-            "condition",
-            {}
-        )
-    )
-
+    current = weather_data.get("current", {})
+    current_code = current.get("weather_code")
 
     current_result = {
-
-        "temperature":
-            current_data.get(
-                "temp_c"
-            ),
-
-        "feels_like":
-            current_data.get(
-                "feelslike_c"
-            ),
-
-        "humidity":
-            current_data.get(
-                "humidity"
-            ),
-
-        "wind_speed":
-            current_data.get(
-                "wind_kph"
-            ),
-
-        "precipitation":
-            current_data.get(
-                "precip_mm"
-            ),
-
-        "weather_code":
-            current_condition.get(
-                "code"
-            ),
-
-        "condition":
-            current_condition.get(
-                "text"
-            )
+        "temperature": current.get("temperature_2m"),
+        "feels_like": current.get("apparent_temperature"),
+        "humidity": current.get("relative_humidity_2m"),
+        "wind_speed": current.get("wind_speed_10m"),
+        "precipitation": current.get("precipitation"),
+        "weather_code": current_code,
+        "condition": weather_condition(current_code)
     }
 
-
-    # =====================================================
-    # RETURN
-    # =====================================================
-
     return {
-
-        "success":
-            True,
-
+        "success": True,
         "location": {
-
-            "latitude":
-                latitude,
-
-            "longitude":
-                longitude,
-
-            "name":
-                location_data.get(
-                    "name"
-                ),
-
-            "country":
-                location_data.get(
-                    "country"
-                ),
-
-            "timezone":
-                location_data.get(
-                    "tz_id"
-                )
+            "latitude": latitude,
+            "longitude": longitude,
+            "timezone": weather_data.get("timezone", "auto")
         },
-
-        "date":
-            target_date,
-
-        "time_of_day":
-            time_of_day,
-
-        "current":
-            current_result,
-
-        "daily":
-            daily_result,
-
-        "hourly":
-            hourly_result
+        "date": target_date,
+        "time_of_day": time_of_day,
+        "current": current_result,
+        "daily": daily_result,
+        "hourly": hourly_result
     }
 
 
@@ -776,137 +433,28 @@ def get_weather_for_city(
     time_of_day="all_day"
 ):
 
-    if not WEATHER_API_KEY:
-
-        return {
-
-            "success": False,
-
-            "error":
-                "WEATHER_API_KEY is not configured."
-        }
-
-
     try:
-
-        data = weatherapi_request(
-            city=city
-        )
-
-
+        location = get_coordinates(city)
     except Exception as error:
-
         return {
-
             "success": False,
-
-            "error":
-                str(error)
+            "error": f"Could not find location: {error}"
         }
 
-
-    # -----------------------------------------------------
-    # Get coordinates
-    # -----------------------------------------------------
-
-    location = data.get(
-        "location",
-        {}
-    )
-
-
-    latitude = location.get(
-        "lat"
-    )
-
-
-    longitude = location.get(
-        "lon"
-    )
-
-
-    if (
-        latitude is None
-        or longitude is None
-    ):
-
+    if location is None:
         return {
-
             "success": False,
-
-            "error":
-                f"Could not find location: {city}"
+            "error": f"Could not find location: {city}"
         }
-
-
-    # -----------------------------------------------------
-    # Put already-fetched data into cache
-    #
-    # This prevents another WeatherAPI request.
-    # -----------------------------------------------------
-
-    cache_key = (
-
-        round(latitude, 2),
-
-        round(longitude, 2)
-    )
-
-
-    _weather_cache[cache_key] = (
-
-        time.time(),
-
-        data
-    )
-
-
-    # -----------------------------------------------------
-    # Process weather
-    # -----------------------------------------------------
 
     result = get_weather_for_coordinates(
-
-        latitude,
-
-        longitude,
-
+        location["latitude"],
+        location["longitude"],
         date,
-
         time_of_day
     )
 
-
-    # -----------------------------------------------------
-    # Add complete location information
-    # -----------------------------------------------------
-
-    result["location"] = {
-
-        "latitude":
-            latitude,
-
-        "longitude":
-            longitude,
-
-        "name":
-            location.get(
-                "name"
-            ),
-
-        "country":
-            location.get(
-                "country"
-            ),
-
-        "timezone":
-            location.get(
-                "tz_id",
-                "auto"
-            )
-    }
-
-
+    result["location"] = location
     return result
 
 
@@ -1486,7 +1034,7 @@ def home():
             "WeatherGPT API is running",
 
         "weather_provider":
-            "WeatherAPI",
+            "Open-Meteo GFS",
 
         "ai_provider":
             "Groq"
