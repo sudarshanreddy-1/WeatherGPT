@@ -364,31 +364,49 @@
 
     async function fetchOpenMeteoGFSContext(force = false) {
 
-        if (
-            userLatitude === null ||
-            userLongitude === null
-        ) {
+        if (userLatitude === null || userLongitude === null) {
             return null;
         }
 
-        if (!force) {
-            const cached = getCachedWeatherContext();
-            if (cached) {
-                weatherContextCache = cached;
-                return cached;
-            }
+        return fetchOpenMeteoForCoordinates(
+            userLatitude,
+            userLongitude,
+            "Current location",
+            force,
+            WEATHER_CACHE_KEY
+        );
+    }
 
-            if (weatherContextCache) {
-                return weatherContextCache;
+
+    async function fetchOpenMeteoForCoordinates(
+        latitude,
+        longitude,
+        locationName,
+        force = false,
+        cacheKey = null
+    ) {
+
+        if (!force && cacheKey) {
+            try {
+                const raw = localStorage.getItem(cacheKey);
+                if (raw) {
+                    const cached = JSON.parse(raw);
+                    if (
+                        Date.now() - cached.timestamp < WEATHER_CACHE_TTL &&
+                        cached.latitude !== null &&
+                        cached.longitude !== null
+                    ) {
+                        return cached.context;
+                    }
+                }
+            } catch (error) {
+                console.warn("Weather cache read failed:", error);
             }
         }
 
-        // 5 current + 4 daily variables = 9 variables.
-        // Keeping this request below 10 variables avoids the
-        // extra weighted API-call cost on Open-Meteo's free tier.
         const params = new URLSearchParams({
-            latitude: userLatitude,
-            longitude: userLongitude,
+            latitude,
+            longitude,
             timezone: "auto",
             forecast_days: "7",
             current: "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,precipitation,weather_code",
@@ -413,32 +431,129 @@
 
             const context = {
                 source: "Open-Meteo NOAA GFS",
+                location: locationName,
                 fetched_at: new Date().toISOString(),
                 timezone: data.timezone,
-                latitude: userLatitude,
-                longitude: userLongitude,
+                latitude,
+                longitude,
                 current: data.current,
                 daily: data.daily
             };
 
-            weatherContextCache = JSON.stringify(context);
+            const contextString = JSON.stringify(context);
 
-            localStorage.setItem(
-                WEATHER_CACHE_KEY,
-                JSON.stringify({
-                    timestamp: Date.now(),
-                    latitude: userLatitude,
-                    longitude: userLongitude,
-                    context: weatherContextCache
-                })
-            );
+            if (cacheKey) {
+                localStorage.setItem(
+                    cacheKey,
+                    JSON.stringify({
+                        timestamp: Date.now(),
+                        latitude,
+                        longitude,
+                        context: contextString
+                    })
+                );
+            }
 
-            return weatherContextCache;
+            return contextString;
 
         } catch (error) {
-            console.error("Open-Meteo GFS error:", error);
+            console.error(`Open-Meteo GFS error for ${locationName}:`, error);
             return null;
         }
+    }
+
+
+    function extractRequestedCity(text) {
+
+        const patterns = [
+            /\b(?:in|for|at|near)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?=\s+(?:right now|now|today|tomorrow|tonight|this morning|this afternoon|this evening|weather|forecast)\b|[?.!,]|$)/i,
+            /^\s*([A-Za-z][A-Za-z .'-]{1,60}?)\s+(?:weather|forecast)\b/i
+        ];
+
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            if (match && match[1]) {
+                const city = match[1]
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .replace(/[?.!,]+$/, "");
+
+                const blocked = new Set([
+                    "the weather",
+                    "weather",
+                    "here",
+                    "there",
+                    "my location",
+                    "current location",
+                    "what is the",
+                    "what's the"
+                ]);
+
+                if (city && !blocked.has(city.toLowerCase())) {
+                    return city;
+                }
+            }
+        }
+
+        return null;
+    }
+
+
+    async function fetchOpenMeteoForCity(city) {
+
+        const cacheKey = `weathergpt_city_gfs_${city.toLowerCase()}`;
+
+        try {
+            const raw = localStorage.getItem(cacheKey);
+            if (raw) {
+                const cached = JSON.parse(raw);
+                if (Date.now() - cached.timestamp < WEATHER_CACHE_TTL) {
+                    return cached.context;
+                }
+            }
+        } catch (error) {
+            console.warn("City weather cache read failed:", error);
+        }
+
+        const geoParams = new URLSearchParams({
+            name: city,
+            count: "1",
+            language: "en",
+            format: "json"
+        });
+
+        const geoResponse = await fetch(
+            `https://geocoding-api.open-meteo.com/v1/search?${geoParams.toString()}`,
+            {
+                headers: { "Accept": "application/json" },
+                cache: "no-store"
+            }
+        );
+
+        if (!geoResponse.ok) {
+            throw new Error(`Open-Meteo geocoding returned ${geoResponse.status}`);
+        }
+
+        const geoData = await geoResponse.json();
+        const place = geoData.results && geoData.results[0];
+
+        if (!place) {
+            throw new Error(`City not found: ${city}`);
+        }
+
+        const displayName = [
+            place.name,
+            place.admin1,
+            place.country
+        ].filter(Boolean).join(", ");
+
+        return fetchOpenMeteoForCoordinates(
+            place.latitude,
+            place.longitude,
+            displayName,
+            false,
+            cacheKey
+        );
     }
 
 
@@ -524,11 +639,26 @@
             // FETCH OPEN-METEO GFS IN BROWSER
             // ==================================
 
-            // The browser calls Open-Meteo directly. This prevents
-            // Render's shared outbound IP from being the source of
-            // Open-Meteo rate-limit errors.
-            const weatherContext =
-                await fetchOpenMeteoGFSContext();
+            // If the user names a city, resolve that city and fetch
+            // its GFS data directly from the browser. This avoids
+            // Render's shared outbound IP being rate-limited.
+            const requestedCity = extractRequestedCity(text);
+
+            let weatherContext = null;
+
+            if (requestedCity) {
+                try {
+                    weatherContext = await fetchOpenMeteoForCity(requestedCity);
+                } catch (error) {
+                    console.error("City Open-Meteo lookup failed:", error);
+                }
+            }
+
+            // If no explicit city was requested, use the user's
+            // current GPS location.
+            if (!weatherContext) {
+                weatherContext = await fetchOpenMeteoGFSContext();
+            }
 
             if (weatherContext) {
                 params.append(
